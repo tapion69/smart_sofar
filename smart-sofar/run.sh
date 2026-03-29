@@ -74,6 +74,7 @@ logi "Serial port: ${SERIAL_PORT:-<empty>}"
 logi "Modbus slave ID: ${MODBUS_SLAVE_ID}"
 logi "Modbus baudrate: ${MODBUS_BAUDRATE}"
 logi "MQTT: ${MQTT_HOST:-<empty>}:${MQTT_PORT} (user: ${MQTT_USER:-<none>})"
+logi "MQTT prefix: ${MQTT_PREFIX}"
 logi "Timezone: ${ADDON_TIMEZONE}"
 
 if [ -z "${SERIAL_PORT}" ]; then
@@ -100,21 +101,34 @@ else
   logi "flows.json à jour (v$ADDON_FLOWS_VERSION), conservation des flows utilisateur"
 fi
 
-if jq -e '.[] | select(.type=="serial-port" and .name=="Sofar Serial Port")' /data/flows.json >/dev/null 2>&1; then
-  jq --arg port "$SERIAL_PORT" --arg baud "$MODBUS_BAUDRATE" '
+# ============================================================
+# Patch Modbus client
+# ============================================================
+if jq -e '.[] | select(.type=="modbus-client" and .name=="Sofar Modbus Serial")' /data/flows.json >/dev/null 2>&1; then
+  jq \
+    --arg serial_port "$SERIAL_PORT" \
+    --arg serial_baudrate "$MODBUS_BAUDRATE" \
+    --arg unit_id "$MODBUS_SLAVE_ID" \
+    '
     map(
-      if .type=="serial-port" and .name=="Sofar Serial Port"
-      then .serialport = $port | .serialbaud = $baud
+      if .type=="modbus-client" and .name=="Sofar Modbus Serial"
+      then
+        .serialPort = $serial_port
+        | .serialBaudrate = $serial_baudrate
+        | .unit_id = $unit_id
       else .
       end
     )
-  ' /data/flows.json > "$tmp" && mv "$tmp" /data/flows.json
+    ' /data/flows.json > "$tmp" && mv "$tmp" /data/flows.json
 
-  logi "Serial node patched: port=${SERIAL_PORT} baud=${MODBUS_BAUDRATE}"
+  logi "Modbus client patched: port=${SERIAL_PORT} baud=${MODBUS_BAUDRATE} slave=${MODBUS_SLAVE_ID}"
 else
-  logw "Noeud serial-port 'Sofar Serial Port' introuvable dans flows.json"
+  logw "Noeud modbus-client 'Sofar Modbus Serial' introuvable dans flows.json"
 fi
 
+# ============================================================
+# Patch MQTT broker
+# ============================================================
 if jq -e '.[] | select(.type=="mqtt-broker" and .name=="HA MQTT Broker")' /data/flows.json >/dev/null 2>&1; then
   jq \
     --arg host "$MQTT_HOST" \
@@ -124,9 +138,9 @@ if jq -e '.[] | select(.type=="mqtt-broker" and .name=="HA MQTT Broker")' /data/
     map(
       if .type=="mqtt-broker" and .name=="HA MQTT Broker"
       then
-        .broker=$host
-        | .port=$port
-        | .user=$user
+        .broker = $host
+        | .port = $port
+        | .user = $user
       else .
       end
     )
@@ -137,6 +151,75 @@ else
   logw "Aucun mqtt-broker nommé 'HA MQTT Broker' trouvé dans flows.json"
 fi
 
+# ============================================================
+# Patch MQTT topics prefix in function nodes
+# ============================================================
+jq \
+  --arg prefix "$MQTT_PREFIX" '
+  map(
+    if .type=="function" and .name=="MERGE state"
+    then .func = (
+"function deepMerge(target, source) {\n\
+  for (const key of Object.keys(source)) {\n\
+    if (source[key] && typeof source[key] === '\''object'\'' && !Array.isArray(source[key])) {\n\
+      if (!target[key] || typeof target[key] !== '\''object'\'' || Array.isArray(target[key])) {\n\
+        target[key] = {};\n\
+      }\n\
+      deepMerge(target[key], source[key]);\n\
+    } else {\n\
+      target[key] = source[key];\n\
+    }\n\
+  }\n\
+  return target;\n\
+}\n\
+\n\
+let state = flow.get('\''sofar_state'\'') || {};\n\
+deepMerge(state, msg.payload || {});\n\
+\n\
+state.last_update = new Date().toISOString();\n\
+state.connection = '\''serial_modbus'\'';\n\
+state.protocol = '\''modbus_rtu'\'';\n\
+state.model_hint = '\''Sofar HYD6000EP'\'';\n\
+state.slave_id = " + $prefix + ";\n\
+state.available = true;\n\
+\n\
+flow.set('\''sofar_state'\'', state);\n\
+\n\
+msg.topic = '\''" )
+    else .
+    end
+  )
+  ' /data/flows.json >/dev/null 2>&1 || true
+
+# Repatch propre des functions topics via substitutions simples ciblées
+jq \
+  --arg prefix "$MQTT_PREFIX" '
+  map(
+    if .type=="function" and .name=="MERGE state"
+    then .func |= gsub("msg.topic = '\\''sofar/1/state'\\'';"; "msg.topic = '\\''" + $prefix + "/1/state'\\'';")
+    elif .type=="function" and .name=="ONLINE"
+    then .func |= gsub("msg.topic = '\\''sofar/1/availability'\\'';"; "msg.topic = '\\''" + $prefix + "/1/availability'\\'';")
+    else .
+    end
+  )
+  ' /data/flows.json > "$tmp" && mv "$tmp" /data/flows.json
+
+# Patch MQTT will topic
+jq \
+  --arg prefix "$MQTT_PREFIX" '
+  map(
+    if .type=="mqtt-broker" and .name=="HA MQTT Broker"
+    then .willTopic = ($prefix + "/1/availability")
+    else .
+    end
+  )
+  ' /data/flows.json > "$tmp" && mv "$tmp" /data/flows.json
+
+logi "MQTT topics patched with prefix: ${MQTT_PREFIX}"
+
+# ============================================================
+# flows_cred.json
+# ============================================================
 if [ -f /data/flows_cred.json ]; then
   rm -f /data/flows_cred.json
   logw "Ancien flows_cred.json supprimé"
