@@ -1,6 +1,6 @@
 name: "Smart Sofar Node-RED"
 version: "0.1.0"
-slug: smart_sofar
+slug: smart-sofar
 description: "Node-RED Sofar Solar bridge to MQTT (RS485 minimal version)"
 
 arch:
